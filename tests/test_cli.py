@@ -367,3 +367,80 @@ class TestAnalyzeWithThreats:
 
         assert result.returncode == 0
         assert "unrecognized arguments" not in result.stderr
+
+
+class TestCaptureDetectionConfig:
+    """Tests that detection config from --config reaches run_dashboard()."""
+
+    def test_detection_config_passed_to_run_dashboard(self, tmp_path: Path) -> None:
+        """_cmd_capture should pass cfg.detection to run_dashboard() as detection_config."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from wirenose.cli import _cmd_capture
+
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text(textwrap.dedent("""\
+            detection:
+              port_scan_threshold: 5
+              syn_flood_threshold: 100
+        """))
+
+        ns = argparse.Namespace(
+            interface="lo",
+            filter=None,
+            count=None,
+            duration=None,
+            output=None,
+            config=str(config_file),
+            no_dashboard=False,
+            command="capture",
+        )
+
+        with patch("wirenose.cli.run_dashboard") as mock_dashboard, \
+             patch("wirenose.cli.print_summary"), \
+             patch("sys.stdout") as mock_stdout:
+            mock_stdout.isatty.return_value = True
+            mock_result = MagicMock()
+            mock_dashboard.return_value = mock_result
+
+            _cmd_capture(ns)
+
+            mock_dashboard.assert_called_once()
+            call_kwargs = mock_dashboard.call_args
+            assert call_kwargs[1]["detection_config"] == {
+                "port_scan_threshold": 5,
+                "syn_flood_threshold": 100,
+            }
+
+    def test_no_detection_config_passes_none(self, tmp_path: Path) -> None:
+        """When config has no detection section, detection_config should be None."""
+        import argparse
+        from unittest.mock import MagicMock, patch
+
+        from wirenose.cli import _cmd_capture
+
+        ns = argparse.Namespace(
+            interface="lo",
+            filter=None,
+            count=None,
+            duration=None,
+            output=None,
+            config=None,
+            no_dashboard=False,
+            command="capture",
+        )
+
+        with patch("wirenose.cli.run_dashboard") as mock_dashboard, \
+             patch("wirenose.cli.print_summary"), \
+             patch("sys.stdout") as mock_stdout:
+            mock_stdout.isatty.return_value = True
+            mock_result = MagicMock()
+            mock_dashboard.return_value = mock_result
+
+            _cmd_capture(ns)
+
+            mock_dashboard.assert_called_once()
+            call_kwargs = mock_dashboard.call_args
+            # Empty dict is falsy, so detection_config should be None
+            assert call_kwargs[1]["detection_config"] is None

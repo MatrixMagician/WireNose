@@ -13,11 +13,12 @@ capture) don't pay the import cost.
 
 from __future__ import annotations
 
+import collections
 import logging
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from wirenose.capture import CaptureEngine
 from wirenose.errors import CapturePermissionError
@@ -174,14 +175,34 @@ def _capture_thread_target(
     output: Path | None,
     stop_event: threading.Event,
     result_holder: list,
+    packet_buffer: collections.deque | None = None,
+    buffer_lock: threading.Lock | None = None,
 ) -> None:
     """Target function for the background capture thread.
 
     Runs ``engine.capture_live()`` with the stop_event, stores the
     CaptureResult into *result_holder[0]* so the main thread can access it
     after joining.
+
+    When *packet_buffer* and *buffer_lock* are provided, each captured packet
+    is also appended to the shared deque under lock.  This lets the main thread
+    run periodic threat detection without disrupting Scapy's ``store=False``
+    mode (K004 intact).
     """
     try:
+        # If a packet buffer is provided, wrap the engine's no-store callback
+        # to also stash packets for detection.
+        if packet_buffer is not None and buffer_lock is not None:
+            original_cb = engine._packet_callback_no_store
+
+            def _combined_callback(pkt) -> None:  # noqa: ANN001
+                original_cb(pkt)
+                with buffer_lock:
+                    packet_buffer.append(pkt)
+
+            # Temporarily replace the callback for this capture session
+            engine._packet_callback_no_store = _combined_callback  # type: ignore[assignment]
+
         result = engine.capture_live(
             iface=iface,
             bpf_filter=bpf_filter,
@@ -205,6 +226,8 @@ def run_dashboard(
     timeout: int | None = None,
     output: Path | None = None,
     refresh_rate: float = 4.0,
+    detection_config: dict[str, Any] | None = None,
+    detection_interval: float = 2.0,
 ) -> CaptureResult:
     """Run the live TUI dashboard with background packet capture.
 
@@ -213,6 +236,10 @@ def run_dashboard(
     refreshes the dashboard layout at *refresh_rate* Hz.  Ctrl+C (KeyboardInterrupt)
     sets the stop event, waits for the capture thread to finish, and returns
     the final CaptureResult.
+
+    Periodically (every *detection_interval* seconds), the main thread copies
+    buffered packets, runs ``ThreatEngine.analyze()``, deduplicates findings,
+    and passes them to the layout builder for the alert panel.
 
     **Important:** Privilege errors are checked before entering the Live
     context so that the error message isn't swallowed by the TUI.
@@ -225,6 +252,9 @@ def run_dashboard(
         timeout: Capture timeout in seconds (None = no timeout).
         output: Path to write pcap output.  None = auto-generated.
         refresh_rate: Dashboard refresh rate in Hz.  Default 4.0 (250ms).
+        detection_config: Optional detection configuration dict passed to
+            ``ThreatEngine.analyze()``.  ``None`` uses engine defaults.
+        detection_interval: Seconds between detection runs.  Default 2.0.
 
     Returns:
         CaptureResult from the capture thread.
@@ -233,6 +263,11 @@ def run_dashboard(
         CapturePermissionError: If libpcap denies access (raised *before*
             entering the TUI so the user sees a clean error message).
     """
+    from scapy.plist import PacketList
+
+    from wirenose.detectors.engine import ThreatEngine
+    from wirenose.detectors.models import ThreatFinding as _ThreatFinding
+
     from rich.live import Live
 
     # Reset engine state so our stats reference is fresh
@@ -242,10 +277,21 @@ def run_dashboard(
     stop_event = threading.Event()
     result_holder: list[CaptureResult | None] = []
 
+    # Packet buffer shared between capture thread and main thread
+    packet_buffer: collections.deque = collections.deque(maxlen=10_000)
+    buffer_lock = threading.Lock()
+
+    # Detection state
+    threat_engine = ThreatEngine()
+    findings: list[_ThreatFinding] = []
+    seen_keys: set[tuple[str, str, str | None]] = set()
+    last_detection_time = time.monotonic()
+
     # Start capture thread
     capture_t = threading.Thread(
         target=_capture_thread_target,
         args=(engine, iface, bpf_filter, count, timeout, output, stop_event, result_holder),
+        kwargs={"packet_buffer": packet_buffer, "buffer_lock": buffer_lock},
         daemon=True,
         name="wirenose-capture",
     )
@@ -256,21 +302,39 @@ def run_dashboard(
 
     try:
         with Live(
-            build_dashboard_layout(engine._stats, iface, bpf_filter, 0.0),
+            build_dashboard_layout(engine._stats, iface, bpf_filter, 0.0, alerts=findings),
             refresh_per_second=refresh_rate,
             screen=False,
         ) as live:
             while capture_t.is_alive():
                 elapsed = time.monotonic() - start_time
+
+                # Periodic threat detection
+                now = time.monotonic()
+                if now - last_detection_time >= detection_interval:
+                    _run_detection(
+                        packet_buffer, buffer_lock, threat_engine,
+                        detection_config, findings, seen_keys,
+                    )
+                    last_detection_time = now
+
                 live.update(
-                    build_dashboard_layout(engine._stats, iface, bpf_filter, elapsed)
+                    build_dashboard_layout(
+                        engine._stats, iface, bpf_filter, elapsed, alerts=findings,
+                    )
                 )
                 time.sleep(refresh_interval)
 
-            # Final update after thread exits (count reached or timeout)
+            # Final detection + layout update after thread exits
+            _run_detection(
+                packet_buffer, buffer_lock, threat_engine,
+                detection_config, findings, seen_keys,
+            )
             elapsed = time.monotonic() - start_time
             live.update(
-                build_dashboard_layout(engine._stats, iface, bpf_filter, elapsed)
+                build_dashboard_layout(
+                    engine._stats, iface, bpf_filter, elapsed, alerts=findings,
+                )
             )
     except KeyboardInterrupt:
         logger.info("Ctrl+C received — stopping capture")
@@ -298,3 +362,45 @@ def run_dashboard(
         pcap_path=output,
     )
     return CaptureResult(packets=None, stats=engine._stats, metadata=metadata)
+
+
+def _run_detection(
+    packet_buffer: collections.deque,
+    buffer_lock: threading.Lock,
+    threat_engine: Any,
+    detection_config: dict[str, Any] | None,
+    findings: list,
+    seen_keys: set[tuple[str, str, str | None]],
+    max_findings: int = 50,
+) -> None:
+    """Copy buffer, run ThreatEngine.analyze(), deduplicate, update findings list.
+
+    Modifies *findings* and *seen_keys* in place.  Exceptions from
+    ``threat_engine.analyze()`` are caught and logged so the dashboard
+    continues even if detection fails.
+    """
+    from scapy.plist import PacketList
+
+    with buffer_lock:
+        snapshot = list(packet_buffer)
+
+    if not snapshot:
+        return
+
+    pkt_list = PacketList(snapshot)
+
+    try:
+        new_findings = threat_engine.analyze(pkt_list, detection_config or {})
+    except Exception:
+        logger.warning("ThreatEngine.analyze() raised — skipping detection cycle", exc_info=True)
+        return
+
+    for finding in new_findings:
+        key = (finding.detector, finding.title, finding.source_ip)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            findings.append(finding)
+
+    # Keep only the last max_findings entries
+    if len(findings) > max_findings:
+        del findings[: len(findings) - max_findings]

@@ -74,6 +74,9 @@ def _cmd_capture(args: argparse.Namespace) -> None:
     engine = CaptureEngine()
     iface, bpf_filter, count, timeout, output_path, refresh_rate = _resolve_capture_args(args)
 
+    # Load config for detection settings
+    cfg = load_config(args.config)
+
     use_dashboard = sys.stdout.isatty() and not args.no_dashboard
 
     if use_dashboard:
@@ -86,6 +89,7 @@ def _cmd_capture(args: argparse.Namespace) -> None:
                 timeout=timeout,
                 output=output_path,
                 refresh_rate=refresh_rate,
+                detection_config=cfg.detection if cfg.detection else None,
             )
         except CapturePermissionError:
             print("Error: Live capture requires elevated privileges. Run with sudo.", file=sys.stderr)

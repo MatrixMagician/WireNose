@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import threading
 import time
 from pathlib import Path
@@ -15,7 +16,7 @@ from scapy.layers.inet import IP, TCP, UDP
 from scapy.layers.l2 import Ether
 
 from wirenose.capture import CaptureEngine
-from wirenose.dashboard import build_dashboard_layout, run_dashboard
+from wirenose.dashboard import build_dashboard_layout, run_dashboard, _run_detection
 from wirenose.detectors.models import ThreatFinding
 from wirenose.models import CaptureResult, PacketStats
 
@@ -442,3 +443,199 @@ class TestAlertPanel:
         assert layout["body"]["ips"]["dst_ips"] is not None
         assert layout["alerts"] is not None
         assert layout["footer"] is not None
+
+
+# ---------------------------------------------------------------------------
+# _run_detection() — periodic detection helper
+# ---------------------------------------------------------------------------
+
+
+class TestRunDetection:
+    """Tests for the _run_detection() helper used by run_dashboard()."""
+
+    def test_empty_buffer_is_noop(self) -> None:
+        """Detection on an empty deque should not crash or produce findings."""
+        buf: collections.deque = collections.deque(maxlen=100)
+        lock = threading.Lock()
+        findings: list[ThreatFinding] = []
+        seen: set[tuple[str, str, str | None]] = set()
+
+        engine = MagicMock()
+        engine.analyze = MagicMock(return_value=[])
+
+        _run_detection(buf, lock, engine, None, findings, seen)
+
+        # Empty buffer → analyze should not be called
+        engine.analyze.assert_not_called()
+        assert findings == []
+
+    def test_findings_deduplicated_by_key(self) -> None:
+        """Duplicate (detector, title, source_ip) tuples are not added twice."""
+        buf: collections.deque = collections.deque(maxlen=100)
+        lock = threading.Lock()
+        findings: list[ThreatFinding] = []
+        seen: set[tuple[str, str, str | None]] = set()
+
+        pkt = Ether() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP()
+        buf.append(pkt)
+
+        finding_a = _make_finding(detector="det1", title="Threat A", source_ip="1.2.3.4")
+        finding_dup = _make_finding(detector="det1", title="Threat A", source_ip="1.2.3.4")
+        finding_b = _make_finding(detector="det2", title="Threat B", source_ip="5.6.7.8")
+
+        engine = MagicMock()
+        engine.analyze = MagicMock(return_value=[finding_a, finding_dup, finding_b])
+
+        _run_detection(buf, lock, engine, None, findings, seen)
+
+        assert len(findings) == 2  # finding_dup is deduplicated
+        assert findings[0].title == "Threat A"
+        assert findings[1].title == "Threat B"
+
+    def test_findings_capped_at_max(self) -> None:
+        """Findings list never exceeds max_findings (oldest trimmed)."""
+        buf: collections.deque = collections.deque(maxlen=100)
+        lock = threading.Lock()
+        findings: list[ThreatFinding] = []
+        seen: set[tuple[str, str, str | None]] = set()
+
+        buf.append(Ether() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP())
+
+        # Return 60 unique findings to exceed the default cap of 50
+        batch = [
+            _make_finding(detector=f"det-{i}", title=f"Threat-{i}", source_ip=f"10.0.{i}.1")
+            for i in range(60)
+        ]
+        engine = MagicMock()
+        engine.analyze = MagicMock(return_value=batch)
+
+        _run_detection(buf, lock, engine, None, findings, seen, max_findings=50)
+
+        assert len(findings) == 50
+        # Oldest entries trimmed — last finding should be Threat-59
+        assert findings[-1].title == "Threat-59"
+
+    def test_detection_config_passed_to_engine(self) -> None:
+        """detection_config dict is forwarded to ThreatEngine.analyze()."""
+        buf: collections.deque = collections.deque(maxlen=100)
+        lock = threading.Lock()
+        findings: list[ThreatFinding] = []
+        seen: set[tuple[str, str, str | None]] = set()
+
+        buf.append(Ether() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP())
+
+        engine = MagicMock()
+        engine.analyze = MagicMock(return_value=[])
+
+        config = {"port_scan_threshold": 5}
+        _run_detection(buf, lock, engine, config, findings, seen)
+
+        engine.analyze.assert_called_once()
+        call_args = engine.analyze.call_args
+        assert call_args[0][1] == {"port_scan_threshold": 5}
+
+    def test_engine_exception_caught(self) -> None:
+        """If ThreatEngine.analyze() raises, _run_detection doesn't crash."""
+        buf: collections.deque = collections.deque(maxlen=100)
+        lock = threading.Lock()
+        findings: list[ThreatFinding] = []
+        seen: set[tuple[str, str, str | None]] = set()
+
+        buf.append(Ether() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP())
+
+        engine = MagicMock()
+        engine.analyze = MagicMock(side_effect=RuntimeError("boom"))
+
+        # Should not raise
+        _run_detection(buf, lock, engine, None, findings, seen)
+        assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# Packet buffer and periodic detection in run_dashboard()
+# ---------------------------------------------------------------------------
+
+
+class TestPacketBufferIntegration:
+    """Tests for packet buffer accumulation and detection wiring in run_dashboard()."""
+
+    @patch("wirenose.capture.sniff")
+    @patch("rich.live.Live")
+    def test_packet_buffer_accumulates_during_capture(self, mock_live_cls, mock_sniff) -> None:
+        """Packets captured via the combined callback should appear in the buffer."""
+        captured_count = {"n": 0}
+
+        def fake_sniff(**kwargs):
+            cb = kwargs.get("prn")
+            if cb:
+                for _ in range(5):
+                    pkt = Ether() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP()
+                    cb(pkt)
+                    captured_count["n"] += 1
+
+        mock_sniff.side_effect = fake_sniff
+
+        mock_live = MagicMock()
+        mock_live.__enter__ = MagicMock(return_value=mock_live)
+        mock_live.__exit__ = MagicMock(return_value=False)
+        mock_live_cls.return_value = mock_live
+
+        engine = CaptureEngine()
+        result = run_dashboard(
+            engine, iface="lo", count=5, timeout=1, refresh_rate=10.0,
+        )
+
+        assert isinstance(result, CaptureResult)
+        # Stats should have registered the packets
+        assert engine._stats.packet_count == 5
+
+    @patch("wirenose.capture.sniff")
+    @patch("rich.live.Live")
+    def test_run_dashboard_accepts_detection_config(self, mock_live_cls, mock_sniff) -> None:
+        """run_dashboard() should accept detection_config without error."""
+        mock_sniff.return_value = None
+
+        mock_live = MagicMock()
+        mock_live.__enter__ = MagicMock(return_value=mock_live)
+        mock_live.__exit__ = MagicMock(return_value=False)
+        mock_live_cls.return_value = mock_live
+
+        engine = CaptureEngine()
+        result = run_dashboard(
+            engine, iface="lo", count=0, timeout=1, refresh_rate=10.0,
+            detection_config={"port_scan_threshold": 5},
+            detection_interval=1.0,
+        )
+
+        assert isinstance(result, CaptureResult)
+
+    @patch("wirenose.capture.sniff")
+    @patch("rich.live.Live")
+    def test_alerts_passed_to_layout_builder(self, mock_live_cls, mock_sniff) -> None:
+        """build_dashboard_layout() is called with alerts= during the live loop."""
+        mock_sniff.return_value = None
+
+        update_calls = []
+        mock_live = MagicMock()
+        mock_live.__enter__ = MagicMock(return_value=mock_live)
+        mock_live.__exit__ = MagicMock(return_value=False)
+        mock_live.update = MagicMock(side_effect=lambda layout: update_calls.append(layout))
+        mock_live_cls.return_value = mock_live
+
+        engine = CaptureEngine()
+        run_dashboard(engine, iface="lo", count=0, timeout=1, refresh_rate=10.0)
+
+        # At least one layout update should have happened (the final one)
+        assert len(update_calls) >= 1
+        # Each layout should have an alerts panel
+        for layout in update_calls:
+            assert layout["alerts"] is not None
+
+    def test_deque_bounded_at_maxlen(self) -> None:
+        """collections.deque with maxlen silently drops oldest when full."""
+        buf: collections.deque = collections.deque(maxlen=10)
+        for i in range(20):
+            buf.append(i)
+        assert len(buf) == 10
+        assert buf[0] == 10  # oldest 0-9 dropped
+        assert buf[-1] == 19

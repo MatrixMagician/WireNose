@@ -30,6 +30,9 @@ class ThreatEngine:
     def _register_defaults(self) -> None:
         """Register the built-in detector functions."""
         from wirenose.detectors.arp_spoof import detect_arp_spoof
+        from wirenose.detectors.cleartext_creds import detect_cleartext_creds
+        from wirenose.detectors.dns_tunnel import detect_dns_tunnel
+        from wirenose.detectors.icmp_anomaly import detect_icmp_anomaly
         from wirenose.detectors.port_scan import detect_port_scan
         from wirenose.detectors.syn_flood import detect_syn_flood
 
@@ -37,6 +40,9 @@ class ThreatEngine:
             detect_port_scan,
             detect_syn_flood,
             detect_arp_spoof,
+            detect_dns_tunnel,
+            detect_icmp_anomaly,
+            detect_cleartext_creds,
         ])
 
     def register(self, detector: DetectorFunc) -> None:

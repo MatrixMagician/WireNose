@@ -1,0 +1,24 @@
+[project]
+name = "wirenose"
+version = "0.1.0"
+description = "A Python-based packet sniffer for SOC use"
+readme = "README.md"
+authors = [
+    { name = "O Hingst", email = "ohingst@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "scapy>=2.6.0",
+]
+
+[project.scripts]
+wirenose = "wirenose.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

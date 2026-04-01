@@ -43,6 +43,10 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── analyze ──
     ana = subparsers.add_parser("analyze", help="Read and analyze a pcap file")
     ana.add_argument("pcap_file", help="Path to the .pcap file to analyze")
+    ana.add_argument(
+        "-C", "--config", default=None, metavar="PATH",
+        help="Path to YAML config file for detection settings",
+    )
 
     return parser
 
@@ -120,6 +124,15 @@ def _cmd_analyze(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     print_summary(result)
+
+    # --- Threat detection ---
+    from wirenose.detectors.engine import ThreatEngine
+    from wirenose.output import print_threats
+
+    cfg = load_config(args.config)
+    threat_engine = ThreatEngine()
+    findings = threat_engine.analyze(result.packets, cfg.detection)
+    print_threats(findings)
 
 
 def main() -> None:

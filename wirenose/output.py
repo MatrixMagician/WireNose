@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from wirenose.models import CaptureResult
+
+if TYPE_CHECKING:
+    from wirenose.detectors.models import ThreatFinding
 
 
 def _human_bytes(n: int) -> str:
@@ -101,3 +106,48 @@ def print_summary(result: CaptureResult) -> None:
     print(f"  Total bytes: {_human_bytes(stats.total_bytes)}")
     print("═" * 50)
     print()
+
+
+# Severity → Rich style mapping
+_SEVERITY_STYLES: dict[str, str] = {
+    "critical": "bold red",
+    "high": "red",
+    "medium": "yellow",
+    "low": "blue",
+    "info": "dim",
+}
+
+
+def print_threats(findings: list[ThreatFinding]) -> None:
+    """Print threat findings with severity coloring via Rich.
+
+    Rich is imported lazily (K008) so ``import wirenose.output`` stays cheap
+    when threat detection is not used.
+
+    Uses a list format rather than a table to ensure full text is visible
+    in both TTY and non-TTY (piped/subprocess) contexts.
+
+    Args:
+        findings: Sorted list of :class:`ThreatFinding` from ThreatEngine.
+    """
+    from rich.console import Console
+
+    console = Console(force_terminal=False)
+
+    if not findings:
+        console.print("\n[green]No threats detected.[/green]\n")
+        return
+
+    console.print(f"\n[bold]Threat Findings ({len(findings)} total)[/bold]")
+
+    for i, finding in enumerate(findings, 1):
+        style = _SEVERITY_STYLES.get(finding.severity, "")
+        src = finding.source_ip or "—"
+        dst = finding.dest_ip or "—"
+        console.print(f"\n  [{style}][{finding.severity.upper()}][/{style}] "
+                       f"{finding.title}")
+        console.print(f"    Detector: {finding.detector}  |  "
+                       f"Source: {src}  →  Dest: {dst}")
+        console.print(f"    {finding.description}")
+
+    console.print()

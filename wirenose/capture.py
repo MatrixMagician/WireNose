@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from scapy.error import Scapy_Exception
+from scapy.layers.dns import DNS, DNSQR  # noqa: F401 — load dissectors for pcap reading
 from scapy.layers.inet import ICMP, IP, TCP, UDP
 from scapy.layers.l2 import ARP, Ether
 from scapy.plist import PacketList

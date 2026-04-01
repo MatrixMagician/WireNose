@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 FIXTURE_PCAP = Path(__file__).parent / "fixtures" / "sample.pcap"
+THREAT_PCAP = Path(__file__).parent / "fixtures" / "threats.pcap"
 
 
 def _run_wirenose(*args: str, timeout: int = 30) -> subprocess.CompletedProcess:
@@ -280,3 +281,89 @@ class TestNoSubcommand:
         assert "usage" in result.stdout.lower() or "wirenose" in result.stdout.lower()
         assert "capture" in result.stdout
         assert "analyze" in result.stdout
+
+
+class TestAnalyzeWithThreats:
+    """Tests for threat detection integration in the analyze subcommand."""
+
+    def test_analyze_with_threats_detects_all_six(self) -> None:
+        """Analyze the threat fixture pcap and verify all 6 detector types appear."""
+        result = _run_wirenose("analyze", str(THREAT_PCAP))
+
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        out = result.stdout
+
+        # Each detector type should produce at least one finding
+        assert "port_scan" in out, f"port_scan not found in output:\n{out}"
+        assert "syn_flood" in out, f"syn_flood not found in output:\n{out}"
+        assert "arp_spoof" in out, f"arp_spoof not found in output:\n{out}"
+        assert "dns_tunnel" in out, f"dns_tunnel not found in output:\n{out}"
+        assert "icmp_anomaly" in out, f"icmp_anomaly not found in output:\n{out}"
+        assert "cleartext_creds" in out, f"cleartext_creds not found in output:\n{out}"
+
+    def test_analyze_with_threats_shows_severity(self) -> None:
+        """Threat output should include severity labels."""
+        result = _run_wirenose("analyze", str(THREAT_PCAP))
+
+        assert result.returncode == 0
+        out = result.stdout
+        # At least CRITICAL and HIGH should appear from our detectors
+        assert "CRITICAL" in out
+        assert "HIGH" in out
+
+    def test_analyze_still_prints_summary(self) -> None:
+        """The packet summary section still appears alongside threat findings."""
+        result = _run_wirenose("analyze", str(THREAT_PCAP))
+
+        assert result.returncode == 0
+        out = result.stdout
+
+        # Summary structural elements
+        assert "Protocol Distribution" in out
+        assert "Top Source IPs" in out
+        assert "Total bytes" in out
+
+        # And threat findings are also present
+        assert "Threat Findings" in out
+
+    def test_analyze_with_config_overrides(self, tmp_path: Path) -> None:
+        """A config file with a low port_scan_threshold makes the detector trigger earlier."""
+        # Create a small pcap with only 6 unique ports (below default 20, above our override 5)
+        from scapy.layers.inet import IP, TCP
+        from scapy.layers.l2 import Ether
+        from scapy.utils import wrpcap
+
+        small_pcap = tmp_path / "small.pcap"
+        pkts = [
+            Ether() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP(dport=port, flags="S")
+            for port in range(1, 7)  # 6 unique ports
+        ]
+        wrpcap(str(small_pcap), pkts)
+
+        # Without config → no port scan detection (6 < 20)
+        result_no_config = _run_wirenose("analyze", str(small_pcap))
+        assert result_no_config.returncode == 0
+        assert "Port Scan" not in result_no_config.stdout
+
+        # With config override → port scan detected (6 > 5)
+        config_file = tmp_path / "test_config.yaml"
+        config_file.write_text("detection:\n  port_scan_threshold: 5\n")
+
+        result_with_config = _run_wirenose("analyze", str(small_pcap), "-C", str(config_file))
+        assert result_with_config.returncode == 0, f"stderr: {result_with_config.stderr}"
+        assert "port_scan" in result_with_config.stdout
+
+    def test_analyze_no_threats_shows_clean_message(self) -> None:
+        """When no threats are detected, a 'No threats detected' message appears."""
+        # The sample fixture has too few packets to trigger any detector
+        result = _run_wirenose("analyze", str(FIXTURE_PCAP))
+
+        assert result.returncode == 0
+        assert "No threats detected" in result.stdout
+
+    def test_analyze_config_flag_accepted(self) -> None:
+        """The -C/--config flag is accepted by the analyze subparser."""
+        result = _run_wirenose("analyze", str(FIXTURE_PCAP), "-C", "/tmp/nonexistent.yaml")
+
+        assert result.returncode == 0
+        assert "unrecognized arguments" not in result.stderr

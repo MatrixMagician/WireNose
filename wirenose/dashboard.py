@@ -27,7 +27,18 @@ from wirenose.output import _human_bytes
 if TYPE_CHECKING:
     from rich.layout import Layout
 
+    from wirenose.detectors.models import ThreatFinding
+
 logger = logging.getLogger(__name__)
+
+# Severity → Rich style mapping (mirrors output._SEVERITY_STYLES)
+_ALERT_SEVERITY_STYLES: dict[str, str] = {
+    "critical": "bold red",
+    "high": "red",
+    "medium": "yellow",
+    "low": "blue",
+    "info": "dim",
+}
 
 
 def build_dashboard_layout(
@@ -35,6 +46,7 @@ def build_dashboard_layout(
     iface: str,
     bpf_filter: str | None,
     elapsed: float,
+    alerts: list[ThreatFinding] | None = None,
 ) -> "Layout":
     """Build a Rich Layout tree from a PacketStats snapshot.
 
@@ -48,15 +60,20 @@ def build_dashboard_layout(
         iface: Network interface being captured on.
         bpf_filter: Active BPF filter expression, or None.
         elapsed: Seconds since capture started.
+        alerts: List of ThreatFinding objects to render in the alert panel.
+            Defaults to an empty list (no threats shown).
 
     Returns:
         A Rich Layout with named panels: ``header``, ``body``, ``protocols``,
-        ``src_ips``, ``dst_ips``, ``footer``.
+        ``src_ips``, ``dst_ips``, ``alerts``, ``footer``.
     """
     from rich.layout import Layout
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
+
+    if alerts is None:
+        alerts = []
 
     snap = stats.to_dict()
     top_src = stats.top_src_ips(10)
@@ -111,11 +128,29 @@ def build_dashboard_layout(
     )
     footer = Panel(footer_text, style="green", title="[bold]Stats[/bold]")
 
+    # ── Alert panel ───────────────────────────────────────
+    if alerts:
+        alert_text = Text()
+        for finding in alerts[-20:]:  # Show last 20 findings
+            style = _ALERT_SEVERITY_STYLES.get(finding.severity, "")
+            src = finding.source_ip or "—"
+            alert_text.append(f"[{finding.severity.upper()}]", style=style)
+            alert_text.append(f" {finding.title} — {finding.detector} | {src}\n")
+    else:
+        alert_text = Text("  No threats detected", style="green")
+
+    alerts_panel = Panel(
+        alert_text,
+        style="red" if alerts else "green",
+        title="[bold]Threat Alerts[/bold]",
+    )
+
     # ── Assemble Layout ─────────────────────────────────────
     layout = Layout(name="root")
     layout.split_column(
         Layout(header, name="header", size=3),
         Layout(name="body"),
+        Layout(alerts_panel, name="alerts", size=8),
         Layout(footer, name="footer", size=3),
     )
     layout["body"].split_row(

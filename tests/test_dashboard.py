@@ -16,6 +16,7 @@ from scapy.layers.l2 import Ether
 
 from wirenose.capture import CaptureEngine
 from wirenose.dashboard import build_dashboard_layout, run_dashboard
+from wirenose.detectors.models import ThreatFinding
 from wirenose.models import CaptureResult, PacketStats
 
 
@@ -298,3 +299,146 @@ class TestRunDashboardKeyboardInterrupt:
 
         assert isinstance(result, CaptureResult)
         assert result.metadata.interface == "lo"
+
+
+# ---------------------------------------------------------------------------
+# Alert panel rendering in build_dashboard_layout()
+# ---------------------------------------------------------------------------
+
+
+def _make_finding(
+    severity: str = "high",
+    title: str = "Test threat",
+    detector: str = "test_detector",
+    source_ip: str = "10.0.0.1",
+) -> ThreatFinding:
+    """Helper to create a ThreatFinding with minimal boilerplate."""
+    return ThreatFinding(
+        detector=detector,
+        severity=severity,
+        title=title,
+        description="test description",
+        source_ip=source_ip,
+    )
+
+
+class TestAlertPanel:
+    """Tests for the alert panel in build_dashboard_layout()."""
+
+    def test_alert_panel_exists_in_layout(self) -> None:
+        """Layout must contain a named 'alerts' region."""
+        stats = PacketStats()
+        layout = build_dashboard_layout(stats, iface="lo", bpf_filter=None, elapsed=0.0)
+        assert layout["alerts"] is not None
+        assert layout["alerts"].name == "alerts"
+
+    def test_empty_alerts_shows_no_threats_message(self) -> None:
+        """When alerts is empty, the panel should show 'No threats detected'."""
+        stats = PacketStats()
+        layout = build_dashboard_layout(
+            stats, iface="lo", bpf_filter=None, elapsed=0.0, alerts=[]
+        )
+        panel = layout["alerts"].renderable
+        assert isinstance(panel, Panel)
+        text_obj = panel.renderable
+        assert "No threats detected" in text_obj.plain
+
+    def test_alerts_default_omitted_shows_no_threats(self) -> None:
+        """When alerts parameter is omitted, same as empty list."""
+        stats = PacketStats()
+        layout = build_dashboard_layout(stats, iface="lo", bpf_filter=None, elapsed=0.0)
+        panel = layout["alerts"].renderable
+        text_obj = panel.renderable
+        assert "No threats detected" in text_obj.plain
+
+    def test_findings_render_severity_and_detector(self) -> None:
+        """Non-empty alerts render severity tag, title, detector, and source IP."""
+        stats = PacketStats()
+        findings = [
+            _make_finding(severity="critical", title="ARP Spoof", detector="arp_spoof", source_ip="192.168.1.5"),
+            _make_finding(severity="low", title="DNS Query", detector="dns_recon", source_ip="10.0.0.2"),
+        ]
+        layout = build_dashboard_layout(
+            stats, iface="lo", bpf_filter=None, elapsed=0.0, alerts=findings
+        )
+        panel = layout["alerts"].renderable
+        text_obj = panel.renderable
+        plain = text_obj.plain
+
+        assert "[CRITICAL]" in plain
+        assert "ARP Spoof" in plain
+        assert "arp_spoof" in plain
+        assert "192.168.1.5" in plain
+        assert "[LOW]" in plain
+        assert "DNS Query" in plain
+        assert "dns_recon" in plain
+
+    def test_alert_panel_severity_styles_applied(self) -> None:
+        """Severity tags should use the correct Rich styles."""
+        from rich.text import Text
+
+        stats = PacketStats()
+        findings = [_make_finding(severity="medium", title="Port scan")]
+        layout = build_dashboard_layout(
+            stats, iface="lo", bpf_filter=None, elapsed=0.0, alerts=findings
+        )
+        panel = layout["alerts"].renderable
+        text_obj = panel.renderable
+        assert isinstance(text_obj, Text)
+        # The MEDIUM tag should have yellow style applied
+        # Walk spans to find the severity tag
+        found_yellow = False
+        for span in text_obj._spans:
+            text_slice = text_obj.plain[span.start : span.end]
+            if "[MEDIUM]" in text_slice and "yellow" in str(span.style):
+                found_yellow = True
+                break
+        assert found_yellow, "MEDIUM severity tag should have yellow style"
+
+    def test_alert_panel_truncates_to_20_findings(self) -> None:
+        """Only the last 20 findings should be rendered when list exceeds 20."""
+        stats = PacketStats()
+        findings = [_make_finding(title=f"threat-{i}") for i in range(30)]
+        layout = build_dashboard_layout(
+            stats, iface="lo", bpf_filter=None, elapsed=0.0, alerts=findings
+        )
+        panel = layout["alerts"].renderable
+        plain = panel.renderable.plain
+
+        # threat-0 through threat-9 should NOT be present (only last 20)
+        assert "threat-0 " not in plain  # space to avoid matching threat-0x
+        assert "threat-9 " not in plain
+        # threat-10 through threat-29 should be present
+        assert "threat-10" in plain
+        assert "threat-29" in plain
+
+    def test_alert_panel_no_source_ip_shows_dash(self) -> None:
+        """When source_ip is None, the panel should show '—' placeholder."""
+        stats = PacketStats()
+        findings = [
+            ThreatFinding(
+                detector="test", severity="info", title="No src",
+                description="desc", source_ip=None,
+            )
+        ]
+        layout = build_dashboard_layout(
+            stats, iface="lo", bpf_filter=None, elapsed=0.0, alerts=findings
+        )
+        panel = layout["alerts"].renderable
+        assert "—" in panel.renderable.plain
+
+    def test_all_prior_panels_still_present(self) -> None:
+        """Adding alerts should not break existing named panels."""
+        stats = PacketStats()
+        findings = [_make_finding()]
+        layout = build_dashboard_layout(
+            stats, iface="lo", bpf_filter=None, elapsed=0.0, alerts=findings
+        )
+        # All original panels + alerts
+        assert layout["header"] is not None
+        assert layout["body"] is not None
+        assert layout["body"]["protocols"] is not None
+        assert layout["body"]["ips"]["src_ips"] is not None
+        assert layout["body"]["ips"]["dst_ips"] is not None
+        assert layout["alerts"] is not None
+        assert layout["footer"] is not None

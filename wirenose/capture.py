@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,6 +48,7 @@ class CaptureEngine:
         timeout: int | None = None,
         output: Path | None = None,
         store: bool = True,
+        stop_event: threading.Event | None = None,
     ) -> CaptureResult:
         """Capture packets from a live network interface.
 
@@ -57,6 +59,10 @@ class CaptureEngine:
             timeout: Capture timeout in seconds. None means no timeout.
             output: Path to save captured packets as .pcap. Auto-generated if None.
             store: If False, packets aren't retained in memory — only stats accumulate.
+            stop_event: Optional threading.Event for external stop signalling. When
+                provided, sniff() is called in a retry loop with timeout=1 so the
+                stop_filter gets checked even on quiet interfaces with no traffic.
+                When None, behavior is unchanged (backward compatible).
 
         Returns:
             CaptureResult with packets (or None if store=False), stats, and metadata.
@@ -70,7 +76,7 @@ class CaptureEngine:
         self._packets = []
 
         # Default to count=100 when neither count nor timeout is specified
-        if count == 0 and timeout is None:
+        if count == 0 and timeout is None and stop_event is None:
             count = 100
 
         start_time = datetime.now(tz=timezone.utc)
@@ -89,8 +95,32 @@ class CaptureEngine:
         if timeout is not None:
             sniff_kwargs["timeout"] = timeout
 
+        # When stop_event is provided, use stop_filter and a 1-second timeout
+        # retry loop so the filter gets checked even on quiet interfaces.
+        if stop_event is not None:
+            sniff_kwargs["stop_filter"] = lambda pkt: stop_event.is_set()
+            if timeout is None:
+                sniff_kwargs["timeout"] = 1
+
         try:
-            sniff(**sniff_kwargs)
+            if stop_event is not None and timeout is None:
+                # Retry loop: sniff with timeout=1 until stop_event is set or
+                # count is reached. Without this, sniff() blocks forever on
+                # quiet interfaces because stop_filter only fires per-packet.
+                remaining = count if count > 0 else 0
+                while True:
+                    loop_kwargs = dict(sniff_kwargs)
+                    if remaining > 0:
+                        loop_kwargs["count"] = remaining
+                    sniff(**loop_kwargs)
+                    if stop_event.is_set():
+                        break
+                    if remaining > 0:
+                        remaining = count - self._stats.packet_count
+                        if remaining <= 0:
+                            break
+            else:
+                sniff(**sniff_kwargs)
         except PermissionError as exc:
             raise CapturePermissionError(interface=iface, original=exc) from exc
         except Scapy_Exception as exc:

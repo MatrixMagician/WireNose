@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -89,6 +90,182 @@ class TestCaptureSubcommand:
         # Should NOT contain argparse error patterns
         assert "unrecognized arguments" not in result.stderr
         assert "error: argument" not in result.stderr
+
+
+class TestNoDashboardFlag:
+    """Tests for the --no-dashboard flag."""
+
+    def test_no_dashboard_flag_accepted(self) -> None:
+        """Verify --no-dashboard is accepted by argparse without errors."""
+        result = _run_wirenose("capture", "-i", "lo", "--no-dashboard")
+
+        # Should fail on permissions, not arg parsing
+        assert result.returncode == 1
+        assert "unrecognized arguments" not in result.stderr
+        assert "elevated privileges" in result.stderr.lower()
+
+    def test_no_dashboard_with_other_flags(self) -> None:
+        """--no-dashboard works alongside all other capture flags."""
+        result = _run_wirenose(
+            "capture", "-i", "lo", "-f", "tcp", "-c", "50",
+            "-d", "5", "-o", "/tmp/test.pcap", "--no-dashboard",
+        )
+
+        assert result.returncode == 1
+        assert "unrecognized arguments" not in result.stderr
+        assert "error: argument" not in result.stderr
+
+
+class TestConfigFlag:
+    """Tests for the --config / -C flag."""
+
+    def test_config_flag_accepted(self) -> None:
+        """Verify --config is accepted by argparse without errors."""
+        # Pass a non-existent config — load_config handles missing gracefully
+        result = _run_wirenose("capture", "-i", "lo", "--config", "/tmp/nonexistent.yaml")
+
+        assert result.returncode == 1
+        assert "unrecognized arguments" not in result.stderr
+        assert "elevated privileges" in result.stderr.lower()
+
+    def test_config_short_flag_accepted(self) -> None:
+        """Verify -C short flag works."""
+        result = _run_wirenose("capture", "-i", "lo", "-C", "/tmp/nonexistent.yaml")
+
+        assert result.returncode == 1
+        assert "unrecognized arguments" not in result.stderr
+        assert "elevated privileges" in result.stderr.lower()
+
+    def test_config_combined_with_no_dashboard(self) -> None:
+        """Both --config and --no-dashboard can be used together."""
+        result = _run_wirenose(
+            "capture", "-i", "lo", "-C", "/tmp/nonexistent.yaml", "--no-dashboard",
+        )
+
+        assert result.returncode == 1
+        assert "unrecognized arguments" not in result.stderr
+
+
+class TestPrivilegeErrorRegression:
+    """Ensure privilege errors are caught before any TUI flash."""
+
+    def test_nonroot_capture_exits_clean_with_privilege_error(self) -> None:
+        """Non-root capture must exit 1 with a clean error message — no TUI flash.
+
+        This is a regression test: if the dashboard launches before checking
+        privileges, users see a brief TUI flicker before the error.
+        """
+        result = _run_wirenose("capture", "-i", "lo")
+
+        assert result.returncode == 1
+        assert "elevated privileges" in result.stderr.lower()
+        # No Rich TUI escape sequences should leak to stdout
+        assert "\x1b[" not in result.stdout
+
+    def test_nonroot_with_dashboard_flag_exits_clean(self) -> None:
+        """Even without --no-dashboard, non-root gets a clean privilege error."""
+        result = _run_wirenose("capture", "-i", "lo", "-d", "5")
+
+        assert result.returncode == 1
+        assert "elevated privileges" in result.stderr.lower()
+
+
+class TestConfigMerging:
+    """Test that config file values are used as defaults when CLI args aren't specified."""
+
+    def test_config_values_used_as_defaults(self, tmp_path: Path) -> None:
+        """Config file values should provide defaults that CLI args can override.
+
+        We test this via the unit-level _resolve_capture_args() to avoid
+        needing root privileges for a full capture.
+        """
+        import argparse
+
+        from wirenose.cli import _resolve_capture_args
+
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text(textwrap.dedent("""\
+            bpf_filter: "udp port 53"
+            count: 200
+            timeout: 60
+            dashboard_refresh_rate: 2.0
+        """))
+
+        # Simulate argparse namespace with only interface and config set
+        ns = argparse.Namespace(
+            interface="eth0",
+            filter=None,
+            count=None,
+            duration=None,
+            output=None,
+            config=str(config_file),
+            no_dashboard=False,
+        )
+
+        iface, bpf_filter, count, timeout, output_path, refresh_rate = _resolve_capture_args(ns)
+
+        assert iface == "eth0"
+        assert bpf_filter == "udp port 53"
+        assert count == 200
+        assert timeout == 60
+        assert output_path is None
+        assert refresh_rate == 2.0
+
+    def test_cli_args_override_config(self, tmp_path: Path) -> None:
+        """Explicit CLI args should override config file values."""
+        import argparse
+
+        from wirenose.cli import _resolve_capture_args
+
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text(textwrap.dedent("""\
+            bpf_filter: "udp port 53"
+            count: 200
+            timeout: 60
+        """))
+
+        ns = argparse.Namespace(
+            interface="lo",
+            filter="tcp port 80",
+            count=50,
+            duration=10,
+            output="/tmp/out.pcap",
+            config=str(config_file),
+            no_dashboard=False,
+        )
+
+        iface, bpf_filter, count, timeout, output_path, refresh_rate = _resolve_capture_args(ns)
+
+        assert iface == "lo"
+        assert bpf_filter == "tcp port 80"
+        assert count == 50
+        assert timeout == 10
+        assert output_path == Path("/tmp/out.pcap")
+
+    def test_no_config_uses_module_defaults(self) -> None:
+        """Without --config, values come from WireNoseConfig defaults."""
+        import argparse
+
+        from wirenose.cli import _resolve_capture_args
+
+        ns = argparse.Namespace(
+            interface="lo",
+            filter=None,
+            count=None,
+            duration=None,
+            output=None,
+            config=None,
+            no_dashboard=False,
+        )
+
+        iface, bpf_filter, count, timeout, output_path, refresh_rate = _resolve_capture_args(ns)
+
+        assert iface == "lo"
+        assert bpf_filter is None
+        assert count == 100  # WireNoseConfig default
+        assert timeout is None
+        assert output_path is None
+        assert refresh_rate == 4.0  # WireNoseConfig default
 
 
 class TestNoSubcommand:

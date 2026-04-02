@@ -47,6 +47,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "-C", "--config", default=None, metavar="PATH",
         help="Path to YAML config file for detection settings",
     )
+    ana.add_argument(
+        "--report", action="store_true", default=False,
+        help="Generate HTML report with charts and JSON export",
+    )
+    ana.add_argument(
+        "-o", "--output-dir", default=None, metavar="DIR",
+        help="Output directory for report files (default: current dir)",
+    )
 
     return parser
 
@@ -137,6 +145,24 @@ def _cmd_analyze(args: argparse.Namespace) -> None:
     threat_engine = ThreatEngine()
     findings = threat_engine.analyze(result.packets, cfg.detection)
     print_threats(findings)
+
+    # --- Report generation ---
+    if args.report:
+        from wirenose.export import copy_pcap, export_json
+        from wirenose.report import generate_report
+
+        output_dir = Path(args.output_dir or cfg.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        html_path = generate_report(result, findings, output_dir, cfg.report)
+        json_path = export_json(result, findings, output_dir)
+        pcap_path = copy_pcap(result.metadata.pcap_path, output_dir)
+
+        print(f"\nReport generated:")
+        print(f"  HTML : {html_path}")
+        print(f"  JSON : {json_path}")
+        if pcap_path:
+            print(f"  PCAP : {pcap_path}")
 
 
 def main() -> None:

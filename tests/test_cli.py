@@ -444,3 +444,84 @@ class TestCaptureDetectionConfig:
             call_kwargs = mock_dashboard.call_args
             # Empty dict is falsy, so detection_config should be None
             assert call_kwargs[1]["detection_config"] is None
+
+
+class TestAnalyzeReportFlag:
+    """Tests for the --report and --output-dir flags on the analyze subcommand."""
+
+    def test_analyze_report_generates_output_files(self, tmp_path: Path) -> None:
+        """--report -o <dir> produces HTML, JSON, and pcap copy in output directory."""
+        result = _run_wirenose("analyze", str(THREAT_PCAP), "--report", "-o", str(tmp_path))
+
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+
+        assert (tmp_path / "report.html").exists(), "report.html not found"
+        assert (tmp_path / "report.json").exists(), "report.json not found"
+        assert (tmp_path / "threats.pcap").exists(), "threats.pcap copy not found"
+
+    def test_analyze_report_html_contains_findings(self, tmp_path: Path) -> None:
+        """The generated HTML report contains threat-related text."""
+        _run_wirenose("analyze", str(THREAT_PCAP), "--report", "-o", str(tmp_path))
+
+        html = (tmp_path / "report.html").read_text(encoding="utf-8")
+        # Threats fixture triggers port_scan and syn_flood among others
+        assert "port_scan" in html or "Port Scan" in html
+        assert "syn_flood" in html or "SYN Flood" in html
+
+    def test_analyze_report_json_is_valid(self, tmp_path: Path) -> None:
+        """The generated JSON report is valid and has expected top-level keys."""
+        import json
+
+        _run_wirenose("analyze", str(THREAT_PCAP), "--report", "-o", str(tmp_path))
+
+        data = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+        assert "wirenose_version" in data
+        assert "capture" in data
+        assert "findings" in data
+        assert "finding_summary" in data
+        assert data["finding_summary"]["total"] > 0
+
+    def test_analyze_report_default_output_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--report without -o writes files into the current working directory."""
+        monkeypatch.chdir(tmp_path)
+
+        result = _run_wirenose("analyze", str(THREAT_PCAP), "--report")
+
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert (tmp_path / "report.html").exists()
+        assert (tmp_path / "report.json").exists()
+
+    def test_analyze_without_report_flag_unchanged(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Without --report, no report files are created and output matches pre-existing behavior."""
+        monkeypatch.chdir(tmp_path)
+
+        result = _run_wirenose("analyze", str(THREAT_PCAP))
+
+        assert result.returncode == 0
+        # No report files should be generated
+        assert not (tmp_path / "report.html").exists()
+        assert not (tmp_path / "report.json").exists()
+        # Normal output still present
+        assert "Report generated" not in result.stdout
+
+    def test_analyze_report_prints_output_paths(self, tmp_path: Path) -> None:
+        """When --report is used, output paths are printed to stdout."""
+        result = _run_wirenose("analyze", str(THREAT_PCAP), "--report", "-o", str(tmp_path))
+
+        assert result.returncode == 0
+        out = result.stdout
+        assert "Report generated:" in out
+        assert "HTML" in out
+        assert "JSON" in out
+        assert "PCAP" in out
+
+    def test_analyze_report_creates_output_dir(self, tmp_path: Path) -> None:
+        """--output-dir creates the directory if it doesn't exist."""
+        new_dir = tmp_path / "nested" / "output"
+        assert not new_dir.exists()
+
+        result = _run_wirenose("analyze", str(THREAT_PCAP), "--report", "-o", str(new_dir))
+
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        assert new_dir.exists()
+        assert (new_dir / "report.html").exists()

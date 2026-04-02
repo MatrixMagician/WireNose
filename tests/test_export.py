@@ -224,7 +224,7 @@ class TestExportJson:
         result = _make_result(tmp_path)
         json_path = export_json(result, [], tmp_path / "out")
         data = json.loads(json_path.read_text())
-        assert data["wirenose_version"] == "0.1.0"
+        assert data["wirenose_version"] == "1.0.0"
 
     def test_generated_at_is_iso_string(self, tmp_path: Path) -> None:
         result = _make_result(tmp_path)
